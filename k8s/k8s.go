@@ -37,12 +37,19 @@ import (
 	calicoclient "github.com/projectcalico/libcalico-go/lib/client"
 )
 
+const (
+	ipamIPAnnotation      = "network.tess.io/allocated_ip"
+	ipamGatewayAnnotation = "network.tess.io/allocated_gateway"
+	ipamNetmaskAnnotation = "network.tess.io/allocated_mask"
+)
+
 // CmdAddK8s performs the "ADD" operation on a kubernetes pod
 // Having kubernetes code in its own file avoids polluting the mainline code. It's expected that the kubernetes case will
 // more special casing than the mainline code.
 func CmdAddK8s(args *skel.CmdArgs, conf utils.NetConf, hostname string, calicoClient *calicoclient.Client, endpoint *api.WorkloadEndpoint) (*types.Result, error) {
 	var err error
 	var result *types.Result
+	shouldCallIPAM := true
 
 	k8sArgs := utils.K8sArgs{}
 	err = types.LoadArgs(args.Args, &k8sArgs)
@@ -101,16 +108,20 @@ func CmdAddK8s(args *skel.CmdArgs, conf utils.NetConf, hostname string, calicoCl
 				return nil, err
 			}
 			logger.WithField("stdin", args.StdinData).Debug("Updated stdin data")
+		} else if conf.IPAM.Type == "pod-annotations" {
+			shouldCallIPAM = false
+			result, err = getIPfromAnnotation(client, workload)
+			logger.Debugf("Parsed IP info from pod annotations: %+v", result)
 		}
-
-		// Run the IPAM plugin
-		logger.Debugf("Calling IPAM plugin %s", conf.IPAM.Type)
-		result, err = ipam.ExecAdd(conf.IPAM.Type, args.StdinData)
-		if err != nil {
-			return nil, err
+		if shouldCallIPAM {
+			// Run the IPAM plugin
+			logger.Debugf("Calling IPAM plugin %s", conf.IPAM.Type)
+			result, err = ipam.ExecAdd(conf.IPAM.Type, args.StdinData)
+			if err != nil {
+				return nil, err
+			}
+			logger.Debugf("IPAM plugin returned: %+v", result)
 		}
-		logger.Debugf("IPAM plugin returned: %+v", result)
-
 		// Create the endpoint object and configure it.
 		endpoint = api.NewWorkloadEndpoint()
 		endpoint.Metadata.Name = args.IfName
@@ -130,8 +141,10 @@ func CmdAddK8s(args *skel.CmdArgs, conf utils.NetConf, hostname string, calicoCl
 
 		// Populate the endpoint with the output from the IPAM plugin.
 		if err = utils.PopulateEndpointNets(endpoint, result); err != nil {
-			// Cleanup IP allocation and return the error.
-			utils.ReleaseIPAllocation(logger, conf.IPAM.Type, args.StdinData)
+			if shouldCallIPAM {
+				// Cleanup IP allocation and return the error.
+				utils.ReleaseIPAllocation(logger, conf.IPAM.Type, args.StdinData)
+			}
 			return nil, err
 		}
 		logger.WithField("endpoint", endpoint).Info("Populated endpoint")
@@ -266,4 +279,31 @@ func getPodCidr(client *kubernetes.Clientset, conf utils.NetConf, hostname strin
 	} else {
 		return node.Spec.PodCIDR, nil
 	}
+}
+
+func getIPfromAnnotation(client *kubernetes.Clientset, workload string) (*types.Result, error) {
+	if len(workload) == 0 || len(strings.Split(workload, ".")) != 2 {
+		return nil, fmt.Errorf("Invalid workload %s", workload)
+	}
+	splitwl := strings.Split(workload, ".")
+	ns := splitwl[0]
+	podname := splitwl[1]
+	pods, err := client.Pods(ns).Get(podname)
+	if err != nil {
+		return nil, err
+	}
+
+	if pods.Annotations == nil || len(pods.Annotations[ipamIPAnnotation]) == 0 {
+		return nil, fmt.Errorf("tessnet ip annotations not available yet, will retry in next cycle")
+	}
+	fmt.Fprintf(os.Stderr, "pod %s/%s annotations : %v\n", pods.Namespace, pods.Name, pods.Annotations)
+	result := &types.Result{}
+	parsedIP := types.IPConfig{}
+	parsedIP.Gateway = net.ParseIP(pods.Annotations[ipamGatewayAnnotation]).To4()
+	parsedIP.IP = net.IPNet{
+		IP:   net.ParseIP(pods.Annotations[ipamIPAnnotation]).To4(),
+		Mask: net.IPMask(net.ParseIP(pods.Annotations[ipamNetmaskAnnotation]).To4()),
+	}
+	result.IP4 = &parsedIP
+	return result, nil
 }
